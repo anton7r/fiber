@@ -7,6 +7,7 @@ package fiber
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,8 @@ type Router interface {
 	All(path string, handlers ...Handler) Router
 
 	Group(prefix string, handlers ...Handler) Router
+
+	Mount(prefix string, fiber *App) Router
 }
 
 // Route is a struct that holds all metadata for each registered handler
@@ -52,33 +55,35 @@ type Route struct {
 	Handlers []Handler `json:"-"`      // Ctx handlers
 }
 
-func (r *Route) match(path, original string, params *[maxParams]string) (match bool) {
-	// root path check
-	if r.root && path == "/" {
+func (r *Route) match(detectionPath, path string, params *[maxParams]string) (match bool) {
+	// root detectionPath check
+	if r.root && detectionPath == "/" {
 		return true
-		// '*' wildcard matches any path
+		// '*' wildcard matches any detectionPath
 	} else if r.star {
-		if len(original) > 1 {
-			params[0] = original[1:]
+		if len(path) > 1 {
+			params[0] = path[1:]
+		} else {
+			params[0] = ""
 		}
 		return true
 	}
 	// Does this route have parameters
 	if len(r.Params) > 0 {
 		// Match params
-		if match := r.routeParser.getMatch(path, original, params, r.use); match {
-			// Get params from the original path
+		if match := r.routeParser.getMatch(detectionPath, path, params, r.use); match {
+			// Get params from the path detectionPath
 			return match
 		}
 	}
 	// Is this route a Middleware?
 	if r.use {
-		// Single slash will match or path prefix
-		if r.root || strings.HasPrefix(path, r.path) {
+		// Single slash will match or detectionPath prefix
+		if r.root || strings.HasPrefix(detectionPath, r.path) {
 			return true
 		}
-		// Check for a simple path match
-	} else if len(r.path) == len(path) && r.path == path {
+		// Check for a simple detectionPath match
+	} else if len(r.path) == len(detectionPath) && r.path == detectionPath {
 		return true
 	}
 	// No match
@@ -102,7 +107,7 @@ func (app *App) next(c *Ctx) (match bool, err error) {
 		route := tree[c.indexRoute]
 
 		// Check if it matches the request path
-		match = route.match(c.path, c.pathOriginal, &c.values)
+		match = route.match(c.detectionPath, c.path, &c.values)
 
 		// No match, next route
 		if !match {
@@ -129,9 +134,7 @@ func (app *App) next(c *Ctx) (match bool, err error) {
 	// If no match, scan stack again if other methods match the request
 	// Moved from app.handler because middleware may break the route chain
 	if !c.matched && methodExist(c) {
-		if catch := c.app.config.ErrorHandler(c, ErrMethodNotAllowed); catch != nil {
-			_ = c.SendStatus(StatusInternalServerError)
-		}
+		err = ErrMethodNotAllowed
 	}
 	return
 }
@@ -275,8 +278,6 @@ func (app *App) register(method, pathRaw string, handlers ...Handler) Router {
 		// Add route to stack
 		app.addRoute(method, &route)
 	}
-	// Build router tree
-	app.buildTree()
 	return app
 }
 
@@ -327,7 +328,7 @@ func (app *App) registerStatic(prefix, root string, config ...Static) Router {
 			if len(path) >= prefixLen {
 				if isStar && getString(path[0:prefixLen]) == prefix {
 					path = append(path[0:0], '/')
-				} else {
+				} else if len(path) > 0 && path[len(path)-1] != '/' {
 					path = append(path[prefixLen:], '/')
 				}
 			}
@@ -340,8 +341,15 @@ func (app *App) registerStatic(prefix, root string, config ...Static) Router {
 			fctx.Response.SetStatusCode(StatusNotFound)
 		},
 	}
+
 	// Set config if provided
+	var cacheControlValue string
 	if len(config) > 0 {
+		maxAge := config[0].MaxAge
+		if maxAge > 0 {
+			cacheControlValue = "public, max-age=" + strconv.Itoa(maxAge)
+		}
+		fs.CacheDuration = config[0].CacheDuration
 		fs.Compress = config[0].Compress
 		fs.AcceptByteRange = config[0].ByteRange
 		fs.GenerateIndexPages = config[0].Browse
@@ -351,11 +359,18 @@ func (app *App) registerStatic(prefix, root string, config ...Static) Router {
 	}
 	fileHandler := fs.NewRequestHandler()
 	handler := func(c *Ctx) error {
+		// Don't execute middleware if Next returns true
+		if config != nil && config[0].Next != nil && config[0].Next(c) {
+			return c.Next()
+		}
 		// Serve file
 		fileHandler(c.fasthttp)
 		// Return request if found and not forbidden
 		status := c.fasthttp.Response.StatusCode()
 		if status != StatusNotFound && status != StatusForbidden {
+			if len(cacheControlValue) > 0 {
+				c.fasthttp.Response.Header.Set(HeaderCacheControl, cacheControlValue)
+			}
 			return nil
 		}
 		// Reset response to default
@@ -385,8 +400,6 @@ func (app *App) registerStatic(prefix, root string, config ...Static) Router {
 	app.addRoute(MethodGet, &route)
 	// Add HEAD route
 	app.addRoute(MethodHead, &route)
-	// Build router tree
-	app.buildTree()
 	return app
 }
 
@@ -408,11 +421,15 @@ func (app *App) addRoute(method string, route *Route) {
 		route.Method = method
 		// Add route to the stack
 		app.stack[m] = append(app.stack[m], route)
+		app.routesRefreshed = true
 	}
 }
 
 // buildTree build the prefix tree from the previously registered routes
 func (app *App) buildTree() *App {
+	if !app.routesRefreshed {
+		return app
+	}
 	// loop all the methods and stacks and create the prefix tree
 	for m := range intMethod {
 		app.treeStack[m] = make(map[string][]*Route)
@@ -438,6 +455,7 @@ func (app *App) buildTree() *App {
 			})
 		}
 	}
+	app.routesRefreshed = false
 
 	return app
 }

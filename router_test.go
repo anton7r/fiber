@@ -1,5 +1,5 @@
 // ⚡️ Fiber is an Express inspired web framework written in Go with ☕️
-// 🤖 Github Repository: https://github.com/gofiber/fiber
+// 📃 Github Repository: https://github.com/gofiber/fiber
 // 📌 API Documentation: https://docs.gofiber.io
 
 package fiber
@@ -8,6 +8,7 @@ package fiber
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http/httptest"
@@ -86,6 +87,16 @@ func Test_Route_Match_Star(t *testing.T) {
 	}
 	params := [maxParams]string{}
 	match := route.match("", "", &params)
+	utils.AssertEqual(t, true, match)
+	utils.AssertEqual(t, [maxParams]string{}, params)
+
+	// with parameter
+	match = route.match("/favicon.ico", "/favicon.ico", &params)
+	utils.AssertEqual(t, true, match)
+	utils.AssertEqual(t, [maxParams]string{"favicon.ico"}, params)
+
+	// without parameter again
+	match = route.match("", "", &params)
 	utils.AssertEqual(t, true, match)
 	utils.AssertEqual(t, [maxParams]string{}, params)
 }
@@ -246,9 +257,26 @@ func Test_Router_Handler_SetETag(t *testing.T) {
 
 	c := &fasthttp.RequestCtx{}
 
-	app.handler(c)
+	app.Handler()(c)
 
 	utils.AssertEqual(t, `"13-1831710635"`, string(c.Response.Header.Peek(HeaderETag)))
+}
+
+func Test_Router_Handler_Catch_Error(t *testing.T) {
+	app := New()
+	app.config.ErrorHandler = func(ctx *Ctx, err error) error {
+		return errors.New("fake error")
+	}
+
+	app.Get("/", func(c *Ctx) error {
+		return ErrForbidden
+	})
+
+	c := &fasthttp.RequestCtx{}
+
+	app.Handler()(c)
+
+	utils.AssertEqual(t, StatusInternalServerError, c.Response.Header.StatusCode())
 }
 
 //////////////////////////////////////////////
@@ -272,6 +300,7 @@ func Benchmark_App_MethodNotAllowed(b *testing.B) {
 	}
 	app.All("/this/is/a/", h)
 	app.Get("/this/is/a/dummy/route/oke", h)
+	appHandler := app.Handler()
 	c := &fasthttp.RequestCtx{}
 
 	c.Request.Header.SetMethod("DELETE")
@@ -279,7 +308,7 @@ func Benchmark_App_MethodNotAllowed(b *testing.B) {
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 	b.StopTimer()
 	utils.AssertEqual(b, 405, c.Response.StatusCode())
@@ -294,6 +323,7 @@ func Benchmark_Router_NotFound(b *testing.B) {
 		return c.Next()
 	})
 	registerDummyRoutes(app)
+	appHandler := app.Handler()
 	c := &fasthttp.RequestCtx{}
 
 	c.Request.Header.SetMethod("DELETE")
@@ -301,7 +331,7 @@ func Benchmark_Router_NotFound(b *testing.B) {
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 	utils.AssertEqual(b, 404, c.Response.StatusCode())
 	utils.AssertEqual(b, "Cannot DELETE /this/route/does/not/exist", string(c.Response.Body()))
@@ -311,6 +341,7 @@ func Benchmark_Router_NotFound(b *testing.B) {
 func Benchmark_Router_Handler(b *testing.B) {
 	app := New()
 	registerDummyRoutes(app)
+	appHandler := app.Handler()
 
 	c := &fasthttp.RequestCtx{}
 
@@ -320,7 +351,7 @@ func Benchmark_Router_Handler(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -330,6 +361,7 @@ func Benchmark_Router_Handler_Strict_Case(b *testing.B) {
 		CaseSensitive: true,
 	})
 	registerDummyRoutes(app)
+	appHandler := app.Handler()
 
 	c := &fasthttp.RequestCtx{}
 
@@ -339,7 +371,7 @@ func Benchmark_Router_Handler_Strict_Case(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -351,13 +383,15 @@ func Benchmark_Router_Chain(b *testing.B) {
 	}
 	app.Get("/", handler, handler, handler, handler, handler, handler)
 
+	appHandler := app.Handler()
+
 	c := &fasthttp.RequestCtx{}
 
 	c.Request.Header.SetMethod("GET")
 	c.URI().SetPath("/")
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -374,13 +408,14 @@ func Benchmark_Router_WithCompression(b *testing.B) {
 	app.Get("/", handler)
 	app.Get("/", handler)
 
+	appHandler := app.Handler()
 	c := &fasthttp.RequestCtx{}
 
 	c.Request.Header.SetMethod("GET")
 	c.URI().SetPath("/")
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -388,6 +423,7 @@ func Benchmark_Router_WithCompression(b *testing.B) {
 func Benchmark_Router_Next(b *testing.B) {
 	app := New()
 	registerDummyRoutes(app)
+	app.startupProcess()
 
 	request := &fasthttp.RequestCtx{}
 
@@ -504,6 +540,7 @@ func Benchmark_Router_Handler_CaseSensitive(b *testing.B) {
 	app := New()
 	app.config.CaseSensitive = true
 	registerDummyRoutes(app)
+	appHandler := app.Handler()
 
 	c := &fasthttp.RequestCtx{}
 
@@ -513,7 +550,7 @@ func Benchmark_Router_Handler_CaseSensitive(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -526,6 +563,8 @@ func Benchmark_Router_Handler_Unescape(b *testing.B) {
 		return nil
 	})
 
+	appHandler := app.Handler()
+
 	c := &fasthttp.RequestCtx{}
 
 	c.Request.Header.SetMethod(MethodDelete)
@@ -535,7 +574,7 @@ func Benchmark_Router_Handler_Unescape(b *testing.B) {
 
 	for n := 0; n < b.N; n++ {
 		c.URI().SetPath("/cr%C3%A9er")
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -544,6 +583,7 @@ func Benchmark_Router_Handler_StrictRouting(b *testing.B) {
 	app := New()
 	app.config.CaseSensitive = true
 	registerDummyRoutes(app)
+	appHandler := app.Handler()
 
 	c := &fasthttp.RequestCtx{}
 
@@ -553,7 +593,7 @@ func Benchmark_Router_Handler_StrictRouting(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		app.handler(c)
+		appHandler(c)
 	}
 }
 
@@ -561,6 +601,7 @@ func Benchmark_Router_Handler_StrictRouting(b *testing.B) {
 func Benchmark_Router_Github_API(b *testing.B) {
 	app := New()
 	registerDummyRoutes(app)
+	app.startupProcess()
 
 	c := &fasthttp.RequestCtx{}
 	var match bool

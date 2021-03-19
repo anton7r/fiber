@@ -13,13 +13,13 @@ import (
 
 // #nosec G103
 // GetString returns a string pointer without allocation
-func GetString(b []byte) string {
+func UnsafeString(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
 }
 
 // #nosec G103
 // GetBytes returns a byte pointer without allocation
-func GetBytes(s string) (bs []byte) {
+func UnsafeBytes(s string) (bs []byte) {
 	sh := (*reflect.StringHeader)(unsafe.Pointer(&s))
 	bh := (*reflect.SliceHeader)(unsafe.Pointer(&bs))
 	bh.Data = sh.Data
@@ -28,9 +28,16 @@ func GetBytes(s string) (bs []byte) {
 	return
 }
 
-// ImmutableString copies a string to make it immutable
-func ImmutableString(s string) string {
-	return string(GetBytes(s))
+// CopyString copies a string to make it immutable
+func CopyString(s string) string {
+	return string(UnsafeBytes(s))
+}
+
+// CopyBytes copies a slice to make it immutable
+func CopyBytes(b []byte) []byte {
+	tmp := make([]byte, len(b))
+	copy(tmp, b)
+	return tmp
 }
 
 const (
@@ -50,22 +57,22 @@ func ByteSize(bytes uint64) string {
 	value := float64(bytes)
 	switch {
 	case bytes >= uExabyte:
-		unit = "E"
+		unit = "EB"
 		value = value / uExabyte
 	case bytes >= uPetabyte:
-		unit = "P"
+		unit = "PB"
 		value = value / uPetabyte
 	case bytes >= uTerabyte:
-		unit = "T"
+		unit = "TB"
 		value = value / uTerabyte
 	case bytes >= uGigabyte:
-		unit = "G"
+		unit = "GB"
 		value = value / uGigabyte
 	case bytes >= uMegabyte:
-		unit = "M"
+		unit = "MB"
 		value = value / uMegabyte
 	case bytes >= uKilobyte:
-		unit = "K"
+		unit = "KB"
 		value = value / uKilobyte
 	case bytes >= uByte:
 		unit = "B"

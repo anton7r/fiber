@@ -33,19 +33,22 @@ const maxParams = 30
 // Ctx represents the Context which hold the HTTP request and response.
 // It has methods for the request query string, parameters, body, HTTP headers and so on.
 type Ctx struct {
-	app          *App                 // Reference to *App
-	route        *Route               // Reference to *Route
-	indexRoute   int                  // Index of the current route
-	indexHandler int                  // Index of the current handler
-	method       string               // HTTP method
-	methodINT    int                  // HTTP method INT equivalent
-	path         string               // Prettified HTTP path -> string copy from pathBuffer
-	pathBuffer   []byte               // Prettified HTTP path buffer
-	treePath     string               // Path for the search in the tree
-	pathOriginal string               // Original HTTP path
-	values       [maxParams]string    // Route parameter values
-	fasthttp     *fasthttp.RequestCtx // Reference to *fasthttp.RequestCtx
-	matched      bool                 // Non use route matched
+	app                 *App                 // Reference to *App
+	route               *Route               // Reference to *Route
+	indexRoute          int                  // Index of the current route
+	indexHandler        int                  // Index of the current handler
+	method              string               // HTTP method
+	methodINT           int                  // HTTP method INT equivalent
+	baseURI             string               // HTTP base uri
+	path                string               // HTTP path with the modifications by the configuration -> string copy from pathBuffer
+	pathBuffer          []byte               // HTTP path buffer
+	detectionPath       string               // Route detection path                                  -> string copy from detectionPathBuffer
+	detectionPathBuffer []byte               // HTTP detectionPath buffer
+	treePath            string               // Path for the search in the tree
+	pathOriginal        string               // Original HTTP path
+	values              [maxParams]string    // Route parameter values
+	fasthttp            *fasthttp.RequestCtx // Reference to *fasthttp.RequestCtx
+	matched             bool                 // Non use route matched
 }
 
 // Range data for c.Range
@@ -63,6 +66,7 @@ type Cookie struct {
 	Value    string    `json:"value"`
 	Path     string    `json:"path"`
 	Domain   string    `json:"domain"`
+	MaxAge   int       `json:"max_age"`
 	Expires  time.Time `json:"expires"`
 	Secure   bool      `json:"secure"`
 	HTTPOnly bool      `json:"http_only"`
@@ -86,15 +90,16 @@ func (app *App) AcquireCtx(fctx *fasthttp.RequestCtx) *Ctx {
 	// Reset matched flag
 	c.matched = false
 	// Set paths
-	c.pathBuffer = append(c.pathBuffer[0:0], fctx.URI().PathOriginal()...)
 	c.pathOriginal = getString(fctx.URI().PathOriginal())
 	// Set method
 	c.method = getString(fctx.Request.Header.Method())
 	c.methodINT = methodInt(c.method)
 	// Attach *fasthttp.RequestCtx to ctx
 	c.fasthttp = fctx
+	// reset base uri
+	c.baseURI = ""
 	// Prettify path
-	c.prettifyPath()
+	c.configDependentPaths()
 	return c
 }
 
@@ -122,21 +127,35 @@ func (c *Ctx) Accepts(offers ...string) string {
 		if commaPos != -1 {
 			spec = utils.Trim(header[:commaPos], ' ')
 		} else {
-			spec = header
+			spec = utils.TrimLeft(header, ' ')
 		}
 		if factorSign := strings.IndexByte(spec, ';'); factorSign != -1 {
 			spec = spec[:factorSign]
 		}
 
+		var mimetype string
 		for _, offer := range offers {
-			mimetype := utils.GetMIME(offer)
-			if len(spec) > 2 && spec[len(spec)-2:] == "/*" {
-				if strings.HasPrefix(spec[:len(spec)-2], strings.Split(mimetype, "/")[0]) {
-					return offer
-				} else if spec == "*/*" {
-					return offer
-				}
-			} else if strings.HasPrefix(spec, mimetype) {
+			if len(offer) == 0 {
+				continue
+				// Accept: */*
+			} else if spec == "*/*" {
+				return offer
+			}
+
+			if strings.IndexByte(offer, '/') != -1 {
+				mimetype = offer // MIME type
+			} else {
+				mimetype = utils.GetMIME(offer) // extension
+			}
+
+			if spec == mimetype {
+				// Accept: <MIME_type>/<MIME_subtype>
+				return offer
+			}
+
+			s := strings.IndexByte(mimetype, '/')
+			// Accept: <MIME_type>/*
+			if strings.HasPrefix(spec, mimetype[:s]) && (spec[s:] == "/*" || mimetype[s:] == "/*") {
 				return offer
 			}
 		}
@@ -205,7 +224,11 @@ func (c *Ctx) Attachment(filename ...string) {
 func (c *Ctx) BaseURL() string {
 	// TODO: Could be improved: 53.8 ns/op  32 B/op  1 allocs/op
 	// Should work like https://codeigniter.com/user_guide/helpers/url_helper.html
-	return c.Protocol() + "://" + c.Hostname()
+	if c.baseURI != "" {
+		return c.baseURI
+	}
+	c.baseURI = c.Protocol() + "://" + c.Hostname()
+	return c.baseURI
 }
 
 // Body contains the raw body submitted in a POST request.
@@ -225,38 +248,42 @@ var decoderPool = &sync.Pool{New: func() interface{} {
 // BodyParser binds the request body to a struct.
 // It supports decoding the following content types based on the Content-Type header:
 // application/json, application/xml, application/x-www-form-urlencoded, multipart/form-data
+// If none of the content types above are matched, it will return a ErrUnprocessableEntity error
 func (c *Ctx) BodyParser(out interface{}) error {
 	// Get decoder from pool
 	schemaDecoder := decoderPool.Get().(*schema.Decoder)
 	defer decoderPool.Put(schemaDecoder)
 
 	// Get content-type
-	ctype := getString(c.fasthttp.Request.Header.ContentType())
+	ctype := utils.ToLower(utils.UnsafeString(c.fasthttp.Request.Header.ContentType()))
 
 	// Parse body accordingly
 	if strings.HasPrefix(ctype, MIMEApplicationJSON) {
 		schemaDecoder.SetAliasTag("json")
 		return json.Unmarshal(c.fasthttp.Request.Body(), out)
-	} else if strings.HasPrefix(ctype, MIMEApplicationForm) {
+	}
+	if strings.HasPrefix(ctype, MIMEApplicationForm) {
 		schemaDecoder.SetAliasTag("form")
 		data := make(map[string][]string)
 		c.fasthttp.PostArgs().VisitAll(func(key []byte, val []byte) {
-			data[getString(key)] = append(data[getString(key)], getString(val))
+			data[utils.UnsafeString(key)] = append(data[utils.UnsafeString(key)], utils.UnsafeString(val))
 		})
 		return schemaDecoder.Decode(out, data)
-	} else if strings.HasPrefix(ctype, MIMEMultipartForm) {
+	}
+	if strings.HasPrefix(ctype, MIMEMultipartForm) {
 		schemaDecoder.SetAliasTag("form")
 		data, err := c.fasthttp.MultipartForm()
 		if err != nil {
 			return err
 		}
 		return schemaDecoder.Decode(out, data.Value)
-	} else if strings.HasPrefix(ctype, MIMETextXML) || strings.HasPrefix(ctype, MIMEApplicationXML) {
+	}
+	if strings.HasPrefix(ctype, MIMETextXML) || strings.HasPrefix(ctype, MIMEApplicationXML) {
 		schemaDecoder.SetAliasTag("xml")
 		return xml.Unmarshal(c.fasthttp.Request.Body(), out)
 	}
 	// No suitable content type found
-	return fmt.Errorf("bodyparser: cannot parse content-type: %v", ctype)
+	return ErrUnprocessableEntity
 }
 
 // ClearCookie expires a specific cookie by key on the client side.
@@ -286,6 +313,7 @@ func (c *Ctx) Cookie(cookie *Cookie) {
 	fcookie.SetValue(cookie.Value)
 	fcookie.SetPath(cookie.Path)
 	fcookie.SetDomain(cookie.Domain)
+	fcookie.SetMaxAge(cookie.MaxAge)
 	fcookie.SetExpire(cookie.Expires)
 	fcookie.SetSecure(cookie.Secure)
 	fcookie.SetHTTPOnly(cookie.HTTPOnly)
@@ -497,15 +525,18 @@ func (c *Ctx) Is(extension string) bool {
 	}
 
 	return strings.HasPrefix(
-		utils.TrimLeft(utils.GetString(c.fasthttp.Request.Header.ContentType()), ' '),
+		utils.TrimLeft(utils.UnsafeString(c.fasthttp.Request.Header.ContentType()), ' '),
 		extensionHeader,
 	)
 }
 
 // JSON converts any interface or string to JSON.
+// Array and slice values encode as JSON arrays,
+// except that []byte encodes as a base64-encoded string,
+// and a nil slice encodes as the null JSON value.
 // This method also sets the content header to application/json.
 func (c *Ctx) JSON(data interface{}) error {
-	raw, err := json.Marshal(data)
+	raw, err := c.app.config.JSONEncoder(data)
 	if err != nil {
 		return err
 	}
@@ -644,17 +675,14 @@ func (c *Ctx) Params(key string, defaultValue ...string) string {
 func (c *Ctx) Path(override ...string) string {
 	if len(override) != 0 && c.path != override[0] {
 		// Set new path to context
-		c.pathBuffer = append(c.pathBuffer[0:0], override[0]...)
 		c.pathOriginal = override[0]
-		// c.path = override[0]
-		// c.pathOriginal = c.path
 
 		// Set new path to request context
 		c.fasthttp.Request.URI().SetPath(c.pathOriginal)
 		// Prettify path
-		c.prettifyPath()
+		c.configDependentPaths()
 	}
-	return c.pathOriginal
+	return c.path
 }
 
 // Protocol contains the request protocol string: http or https for TLS requests.
@@ -692,9 +720,6 @@ func (c *Ctx) Query(key string, defaultValue ...string) string {
 
 // QueryParser binds the query string to a struct.
 func (c *Ctx) QueryParser(out interface{}) error {
-	if c.fasthttp.QueryArgs().Len() < 1 {
-		return nil
-	}
 	// Get decoder from pool
 	var decoder = decoderPool.Get().(*schema.Decoder)
 	defer decoderPool.Put(decoder)
@@ -704,9 +729,9 @@ func (c *Ctx) QueryParser(out interface{}) error {
 
 	data := make(map[string][]string)
 	c.fasthttp.QueryArgs().VisitAll(func(key []byte, val []byte) {
-		k := utils.GetString(key)
-		v := utils.GetString(val)
-		if strings.Index(v, ",") > -1 && equalFieldType(out, reflect.Slice, k) {
+		k := utils.UnsafeString(key)
+		v := utils.UnsafeString(val)
+		if strings.Contains(v, ",") && equalFieldType(out, reflect.Slice, k) {
 			values := strings.Split(v, ",")
 			for i := 0; i < len(values); i++ {
 				data[k] = append(data[k], values[i])
@@ -902,6 +927,9 @@ var sendFileHandler fasthttp.RequestHandler
 // The file is not compressed by default, enable this by passing a 'true' argument
 // Sets the Content-Type response HTTP header field based on the filenames extension.
 func (c *Ctx) SendFile(file string, compress ...bool) error {
+	// Save the filename, we will need it in the error message if the file isn't found
+	filename := file
+
 	// https://github.com/valyala/fasthttp/blob/master/fs.go#L81
 	sendFileOnce.Do(func() {
 		sendFileFS = &fasthttp.FS{
@@ -920,7 +948,7 @@ func (c *Ctx) SendFile(file string, compress ...bool) error {
 	})
 
 	// Keep original path for mutable params
-	c.pathOriginal = utils.ImmutableString(c.pathOriginal)
+	c.pathOriginal = utils.CopyString(c.pathOriginal)
 	// Disable compression
 	if len(compress) <= 0 || !compress[0] {
 		// https://github.com/valyala/fasthttp/blob/master/fs.go#L46
@@ -951,7 +979,7 @@ func (c *Ctx) SendFile(file string, compress ...bool) error {
 	}
 	// Check for error
 	if status != StatusNotFound && fsStatus == StatusNotFound {
-		return fmt.Errorf("sendfile: file %s not found", file)
+		return NewError(StatusNotFound, fmt.Sprintf("sendfile: file %s not found", filename))
 	}
 	return nil
 }
@@ -991,11 +1019,11 @@ func (c *Ctx) SendStream(stream io.Reader, size ...int) error {
 
 // Set sets the response's HTTP header field to the specified key, value.
 func (c *Ctx) Set(key string, val string) {
-	c.fasthttp.Response.Header.Set(key, removeNewLines(val))
+	c.fasthttp.Response.Header.Set(key, val)
 }
 
 func (c *Ctx) setCanonical(key string, val string) {
-	c.fasthttp.Response.Header.SetCanonical(utils.GetBytes(key), utils.GetBytes(val))
+	c.fasthttp.Response.Header.SetCanonical(utils.UnsafeBytes(key), utils.UnsafeBytes(val))
 }
 
 // Subdomains returns a string slice of subdomains in the domain name of the request.
@@ -1072,27 +1100,36 @@ func (c *Ctx) WriteString(s string) (int, error) {
 // XHR returns a Boolean property, that is true, if the request's X-Requested-With header field is XMLHttpRequest,
 // indicating that the request was issued by a client library (such as jQuery).
 func (c *Ctx) XHR() bool {
-	return utils.EqualsFold(utils.GetBytes(c.Get(HeaderXRequestedWith)), []byte("xmlhttprequest"))
+	return utils.EqualFoldBytes(utils.UnsafeBytes(c.Get(HeaderXRequestedWith)), []byte("xmlhttprequest"))
 }
 
-// prettifyPath ...
-func (c *Ctx) prettifyPath() {
-	// If UnescapePath enabled, we decode the path
+// configDependentPaths set paths for route recognition and prepared paths for the user,
+// here the features for caseSensitive, decoded paths, strict paths are evaluated
+func (c *Ctx) configDependentPaths() {
+	c.pathBuffer = append(c.pathBuffer[0:0], c.pathOriginal...)
+	// If UnescapePath enabled, we decode the path and save it for the framework user
 	if c.app.config.UnescapePath {
 		c.pathBuffer = fasthttp.AppendUnquotedArg(c.pathBuffer[:0], c.pathBuffer)
 	}
-	// If CaseSensitive is disabled, we lowercase the original path
-	if !c.app.config.CaseSensitive {
-		c.pathBuffer = utils.ToLowerBytes(c.pathBuffer)
-	}
-	// If StrictRouting is disabled, we strip all trailing slashes
-	if !c.app.config.StrictRouting && len(c.pathBuffer) > 1 && c.pathBuffer[len(c.pathBuffer)-1] == '/' {
-		c.pathBuffer = utils.TrimRightBytes(c.pathBuffer, '/')
-	}
 	c.path = getString(c.pathBuffer)
 
+	// another path is specified which is for routing recognition only
+	// use the path that was changed by the previous configuration flags
+	c.detectionPathBuffer = append(c.detectionPathBuffer[0:0], c.pathBuffer...)
+	// If CaseSensitive is disabled, we lowercase the original path
+	if !c.app.config.CaseSensitive {
+		c.detectionPathBuffer = utils.ToLowerBytes(c.detectionPathBuffer)
+	}
+	// If StrictRouting is disabled, we strip all trailing slashes
+	if !c.app.config.StrictRouting && len(c.detectionPathBuffer) > 1 && c.detectionPathBuffer[len(c.detectionPathBuffer)-1] == '/' {
+		c.detectionPathBuffer = utils.TrimRightBytes(c.detectionPathBuffer, '/')
+	}
+	c.detectionPath = getString(c.detectionPathBuffer)
+
+	// Define the path for dividing routes into areas for fast tree detection, so that fewer routes need to be traversed,
+	// since the first three characters area select a list of routes
 	c.treePath = c.treePath[0:0]
-	if len(c.path) >= 3 {
-		c.treePath = c.path[:3]
+	if len(c.detectionPath) >= 3 {
+		c.treePath = c.detectionPath[:3]
 	}
 }
